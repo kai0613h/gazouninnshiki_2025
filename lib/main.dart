@@ -1,14 +1,66 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/cupertino.dart';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:camera/camera.dart';
+import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:intl/intl.dart';
 import 'package:flutter_ringtone_player/flutter_ringtone_player.dart';
+import 'package:flutter/foundation.dart'; // <-- Isolate(compute)のために追加
 
-// アラーム情報を保持するためのクラス
+// 警告：開発・テスト目的のみ。本番環境では使用しないでください。
+class MyHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    return super.createHttpClient(context)
+      ..badCertificateCallback =
+          (X509Certificate cert, String host, int port) => true;
+  }
+}
+
+const String geminiApiKey =
+    String.fromEnvironment('GEMINI_API_KEY', defaultValue: '');
+
+// ★★★ Isolateで実行されるトップレベル関数 ★★★
+// この関数はクラスの外に定義する必要があります。
+Future<bool> _analyzeImageInIsolate(Map<String, String> arguments) async {
+  final apiKey = arguments['apiKey']!;
+  final imagePath = arguments['path']!;
+
+  // Isolate内では、再度必要なものを初期化します。
+  HttpOverrides.global = MyHttpOverrides();
+
+  try {
+    final bytes = await File(imagePath).readAsBytes();
+    final model = GenerativeModel(apiKey: apiKey, model: 'gemini-2.5-flash');
+    final promptText = "Given one image, decide (1) whether there is at least one ceiling or wall light fixture and (2) whether it is visibly turned on; output exactly one lowercase word with no quotes or extra text: on if both (1) and (2) are true, otherwise off; if uncertain, answer off.";
+    final prompt = [
+      Content.multi([
+        TextPart(promptText),
+        DataPart('image/jpeg', bytes),
+      ])
+    ];
+
+    final response = await model.generateContent(prompt);
+    final text = response.text?.toLowerCase().trim();
+
+    if (text == null || text.isEmpty) {
+      print('Isolate: AI analysis returned an empty response.');
+      return false;
+    }
+
+    print('Isolate AI Response: "$text"');
+    return text.contains('on');
+  } catch (e) {
+    print('Error in Isolate: $e');
+    return false; // エラー時はOFFとして扱う
+  }
+}
+
+
 class Alarm {
   final int id;
   TimeOfDay time;
@@ -17,15 +69,30 @@ class Alarm {
   Alarm({required this.id, required this.time, this.isEnabled = true});
 }
 
-// main関数：アプリの起動点
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  HttpOverrides.global = MyHttpOverrides();
+
+  if (geminiApiKey.isEmpty) {
+    throw StateError('GEMINI_API_KEY が設定されていません。'
+        '--dart-define=GEMINI_API_KEY=YOUR_API_KEY を設定して実行してください。');
+  }
+
   await initializeDateFormatting('ja_JP', null);
   final cameras = await availableCameras();
+  if (cameras.isEmpty) {
+    runApp(const MaterialApp(
+      home: Scaffold(
+        body: Center(
+          child: Text('利用可能なカメラがありません。'),
+        ),
+      ),
+    ));
+    return;
+  }
   runApp(MyApp(camera: cameras.first));
 }
 
-// アプリケーションのルートウィジェット
 class MyApp extends StatelessWidget {
   final CameraDescription camera;
   const MyApp({super.key, required this.camera});
@@ -33,19 +100,19 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '多機能アプリ',
+      title: '二度寝防止アラーム',
       theme: ThemeData.dark().copyWith(
         cupertinoOverrideTheme: const CupertinoThemeData(
           brightness: Brightness.dark,
-          primaryColor: Colors.orange,
+          primaryColor: Colors.orangeAccent,
         ),
       ),
       home: MainScreen(camera: camera),
+      debugShowCheckedModeBanner: false,
     );
   }
 }
 
-// ボトムナビゲーションバーを持つメイン画面
 class MainScreen extends StatefulWidget {
   final CameraDescription camera;
   const MainScreen({super.key, required this.camera});
@@ -55,9 +122,8 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> {
-  int _selectedIndex = 0;
+  int _selectedIndex = 1;
   final GlobalKey<_AlarmClockPageState> _alarmPageKey = GlobalKey();
-  // ★★★ カメラページを外部から操作するためのキーを追加 ★★★
   final GlobalKey<_PeriodicCameraScreenState> _cameraPageKey = GlobalKey();
   late final List<Widget> _pages;
 
@@ -65,22 +131,17 @@ class _MainScreenState extends State<MainScreen> {
   void initState() {
     super.initState();
     _pages = [
-      // ★★★ カメラページにキーを設定 ★★★
       PeriodicCameraScreen(key: _cameraPageKey, camera: widget.camera),
-      // ★★★ アラームページに「撮影開始」の指令を出す関数を渡す ★★★
       AlarmClockPage(
         key: _alarmPageKey,
-        onAlarmRing: _startPeriodicPhotoCapture,
+        onAlarmRing: _handleAlarmRing,
       ),
     ];
   }
 
-  // ★★★ カメラ撮影を開始させるための関数 ★★★
-  void _startPeriodicPhotoCapture() {
-    // 他のページからカメラページのメソッドを呼び出す
-    _cameraPageKey.currentState?.startPeriodicCapture();
-    // カメラページに切り替える
+  void _handleAlarmRing() {
     _onItemTapped(0);
+    _cameraPageKey.currentState?.startCaptureAndAnalysis();
   }
 
   void _onItemTapped(int index) {
@@ -93,11 +154,11 @@ class _MainScreenState extends State<MainScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(_selectedIndex == 0 ? '定期撮影カメラ' : '時計・アラーム'),
+        title: Text(_selectedIndex == 0 ? '照明を認識中...' : '時計・アラーム'),
         actions: _selectedIndex == 1
             ? [
                 IconButton(
-                  icon: const Icon(Icons.add),
+                  icon: const Icon(Icons.add_alarm),
                   onPressed: () => _alarmPageKey.currentState?._addAlarm(),
                 ),
               ]
@@ -125,7 +186,6 @@ class _MainScreenState extends State<MainScreen> {
   }
 }
 
-// --- カメラページ ---
 class PeriodicCameraScreen extends StatefulWidget {
   const PeriodicCameraScreen({super.key, required this.camera});
   final CameraDescription camera;
@@ -135,10 +195,9 @@ class PeriodicCameraScreen extends StatefulWidget {
 
 class _PeriodicCameraScreenState extends State<PeriodicCameraScreen> {
   CameraController? _controller;
-  Timer? _timer;
   bool _isPermissionGranted = false;
-  // ★★★ 撮影中かどうかを管理する状態を追加 ★★★
-  bool _isCapturing = false;
+  bool _isCapturingAndProcessing = false;
+  final ValueNotifier<String> _statusMessage = ValueNotifier<String>('アラーム待機中...');
 
   @override
   void initState() {
@@ -146,123 +205,176 @@ class _PeriodicCameraScreenState extends State<PeriodicCameraScreen> {
     _initializeCamera();
   }
 
+  @override
+  void dispose() {
+    _isCapturingAndProcessing = false;
+    _controller?.dispose();
+    _statusMessage.dispose();
+    super.dispose();
+  }
+
   Future<void> _initializeCamera() async {
     final status = await Permission.camera.request();
-    if (status.isGranted) {
-      if (!mounted) return;
-      setState(() => _isPermissionGranted = true);
-      _controller = CameraController(widget.camera, ResolutionPreset.high);
+    if (!mounted) return;
+    setState(() => _isPermissionGranted = status.isGranted);
+    if (!status.isGranted) {
+      _statusMessage.value = 'カメラの権限がありません。';
+      return;
+    }
+    try {
+      _controller = CameraController(
+        widget.camera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+      );
       await _controller!.initialize();
+      if (mounted) setState(() {});
+    } catch (e) {
       if (mounted) {
-        setState(() {});
-        // ★★★ 初期化時の自動撮影開始を削除 ★★★
-        // startPeriodicCapture();
+        _statusMessage.value = 'カメラの初期化に失敗しました: $e';
       }
-    } else {
-      if (!mounted) return;
-      setState(() => _isPermissionGranted = false);
     }
   }
 
-  // ★★★ 撮影開始のロジック ★★★
-  void startPeriodicCapture() {
-    // すでに撮影中の場合は何もしない
-    if (_isCapturing) return;
+  void startCaptureAndAnalysis() {
+    if (_isCapturingAndProcessing || !mounted) return;
+    setState(() => _isCapturingAndProcessing = true);
+    _statusMessage.value = '天井の照明を探しています...';
+    _captureAndAnalyzeLoop();
+  }
 
-    setState(() {
-      _isCapturing = true;
-    });
+  void stopCaptureAndAnalysis() {
+    if (mounted) {
+      setState(() => _isCapturingAndProcessing = false);
+      _statusMessage.value = 'アラーム待機中...';
+    }
+  }
 
-    _timer = Timer.periodic(const Duration(seconds: 10), (timer) async {
-      if (_controller == null || !_controller!.value.isInitialized) return;
-      try {
-        final image = await _controller!.takePicture();
-        if (mounted) {
-          showDialog(
-            context: context,
-            builder: (BuildContext context) {
-              return AlertDialog(
-                content: Image.file(File(image.path), fit: BoxFit.contain),
-                actions: <Widget>[
-                  TextButton(
-                    child: const Text('閉じる'),
-                    onPressed: () => Navigator.of(context).pop(),
-                  ),
-                ],
-              );
-            },
-          );
-        }
-      } catch (e) {
-        print('写真撮影中にエラーが発生しました: $e');
+  Future<void> _captureAndAnalyzeLoop() async {
+    if (!_isCapturingAndProcessing || !mounted || _controller == null || !_controller!.value.isInitialized) {
+      return;
+    }
+    try {
+      _statusMessage.value = '撮影しています...';
+      final image = await _controller!.takePicture();
+      _statusMessage.value = '画像を解析中です...';
+
+      // ★★★ Isolate(compute)を使って重い処理をバックグラウンドで実行 ★★★
+      final bool isLightOn = await compute(_analyzeImageInIsolate, {
+        'apiKey': geminiApiKey,
+        'path': image.path,
+      });
+
+      if (!mounted) return;
+      if (isLightOn) {
+        _statusMessage.value = '照明を認識しました！偉い！💡\nアラームを停止します。';
+        await FlutterRingtonePlayer().stop();
+        stopCaptureAndAnalysis();
+      } else {
+        _statusMessage.value = 'まだ照明が消えています。\n起きて電気をつけてください！';
       }
-    });
+    } catch (e) {
+      if (mounted) {
+        _statusMessage.value = 'エラーが発生しました。\n10秒後に再試行します。';
+      }
+      print('Error in capture/analysis loop: $e');
+    }
+    if (_isCapturingAndProcessing && mounted) {
+      Future.delayed(const Duration(seconds: 5), _captureAndAnalyzeLoop);
+    }
   }
 
-  // ★★★ 撮影停止のロジックを追加 ★★★
-  void stopPeriodicCapture() {
-    _timer?.cancel();
-    setState(() {
-      _isCapturing = false;
-    });
-  }
-
-  @override
-  void dispose() {
-    _timer?.cancel();
-    _controller?.dispose();
-    super.dispose();
-  }
+  // このメソッドはもう使用しませんが、呼び出し部分を compute に置き換えたことを示すために残しておきます。
+  // Future<bool> _detectLightStatus(String imagePath) async { ... }
 
   @override
   Widget build(BuildContext context) {
     if (!_isPermissionGranted) {
-      return const Center(
-        child: Text('カメラの権限が許可されていません。', style: TextStyle(fontSize: 18)),
-      );
+      return Center(child: Text(_statusMessage.value));
     }
     if (_controller == null || !_controller!.value.isInitialized) {
-      return const Center(child: CircularProgressIndicator());
+      return Center(
+          child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(),
+          const SizedBox(height: 16),
+          ValueListenableBuilder<String>(
+            valueListenable: _statusMessage,
+            builder: (context, message, child) => Text(message),
+          ),
+        ],
+      ));
     }
-    // ★★★ UIの構造を変更 ★★★
-    return Stack(
-      alignment: Alignment.center,
-      children: [
-        // カメラプレビュー
-        CameraPreview(_controller!),
-        // 撮影状態に応じて表示を切り替え
-        if (_isCapturing)
-          // 撮影中の表示
-          Positioned(
-            bottom: 20,
-            child: ElevatedButton.icon(
-              icon: const Icon(Icons.stop_circle),
-              label: const Text('撮影停止'),
-              onPressed: stopPeriodicCapture,
-              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+    return PopScope(
+      canPop: !_isCapturingAndProcessing,
+      onPopInvoked: (bool didPop) {
+        if (didPop) return;
+        if (_isCapturingAndProcessing) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('照明をONにするまでアラームは停止できません！'),
+              duration: Duration(seconds: 2),
             ),
-          )
-        else
-          // 待機中の表示
-          Container(
-            color: Colors.black54,
-            child: const Center(
-              child: Text(
-                'アラーム待機中...',
-                style: TextStyle(fontSize: 24, color: Colors.white),
+          );
+        }
+      },
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          CameraPreview(_controller!),
+          if (_isCapturingAndProcessing)
+            Container(
+              color: Colors.black.withOpacity(0.7),
+              child: Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24.0),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const CircularProgressIndicator(color: Colors.white),
+                      const SizedBox(height: 20),
+                      ValueListenableBuilder<String>(
+                        valueListenable: _statusMessage,
+                        builder: (context, message, child) {
+                          return Text(
+                            message,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                                fontSize: 22,
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
-          ),
-      ],
+          if (!_isCapturingAndProcessing)
+            Container(
+              color: Colors.black54,
+              child: Center(
+                child: ValueListenableBuilder<String>(
+                  valueListenable: _statusMessage,
+                  builder: (context, message, child) {
+                    return Text(
+                      message,
+                      style: const TextStyle(fontSize: 24, color: Colors.white),
+                    );
+                  },
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 }
 
-// --- 時計・アラームページ ---
 class AlarmClockPage extends StatefulWidget {
-  // ★★★ 親ウィジェットから関数を受け取るための変数を追加 ★★★
   final VoidCallback onAlarmRing;
-
   const AlarmClockPage({super.key, required this.onAlarmRing});
 
   @override
@@ -279,9 +391,7 @@ class _AlarmClockPageState extends State<AlarmClockPage> {
   void initState() {
     super.initState();
     _clockTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (mounted) {
-        setState(() => _currentTime = DateTime.now());
-      }
+      if (mounted) setState(() => _currentTime = DateTime.now());
     });
     _alarmTimer = Timer.periodic(const Duration(seconds: 1), _checkAlarms);
   }
@@ -293,28 +403,8 @@ class _AlarmClockPageState extends State<AlarmClockPage> {
           alarm.time.hour == now.hour &&
           alarm.time.minute == now.minute &&
           now.second == 0) {
-        // ★★★ アラームが鳴った時に親から渡された関数を呼び出す ★★★
+        FlutterRingtonePlayer().playAlarm(looping: true);
         widget.onAlarmRing();
-
-        final player = FlutterRingtonePlayer();
-        player.playAlarm(looping: true);
-        showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (context) => AlertDialog(
-            title: const Text('アラーム'),
-            content: Text('${alarm.time.format(context)}の時間です。'),
-            actions: [
-              TextButton(
-                onPressed: () {
-                  player.stop();
-                  Navigator.pop(context);
-                },
-                child: const Text('停止'),
-              ),
-            ],
-          ),
-        );
       }
     }
   }
@@ -363,7 +453,7 @@ class _AlarmClockPageState extends State<AlarmClockPage> {
         const Divider(),
         Expanded(
           child: _alarms.isEmpty
-              ? const Center(child: Text('アラームがありません'))
+              ? const Center(child: Text('アラームが設定されていません'))
               : ListView.builder(
                   itemCount: _alarms.length,
                   itemBuilder: (context, index) {
@@ -374,17 +464,35 @@ class _AlarmClockPageState extends State<AlarmClockPage> {
                         style: TextStyle(
                           fontSize: 28,
                           fontWeight: FontWeight.bold,
+                          decoration: alarm.isEnabled ? TextDecoration.none : TextDecoration.lineThrough,
                           color: alarm.isEnabled ? Colors.white : Colors.grey,
                         ),
                       ),
                       trailing: CupertinoSwitch(
                         value: alarm.isEnabled,
                         onChanged: (bool value) {
-                          setState(() {
-                            alarm.isEnabled = value;
-                          });
+                          setState(() => alarm.isEnabled = value);
                         },
                       ),
+                      onLongPress: () {
+                        showDialog(
+                          context: context,
+                          builder: (context) => AlertDialog(
+                            title: const Text('アラームの削除'),
+                            content: const Text('このアラームを削除しますか？'),
+                            actions: [
+                              TextButton(onPressed: () => Navigator.pop(context), child: const Text('キャンセル')),
+                              TextButton(
+                                onPressed: () {
+                                  setState(() => _alarms.removeAt(index));
+                                  Navigator.pop(context);
+                                },
+                                child: const Text('削除'),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
                     );
                   },
                 ),
