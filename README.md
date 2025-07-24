@@ -15,4 +15,4 @@ For help getting started with Flutter development, view the
 [online documentation](https://docs.flutter.dev/), which offers tutorials,
 samples, guidance on mobile development, and a full API reference.
 
-AIzaSyDlcXF8w4VAu6_DTBwaWLUGyWIo4gsvCu8
+flutter run --dart-define=GEMINI_API_KEY=AIzaSyDlcXF8w4VAu6_DTBwaWLUGyWIo4gsvCu8
